@@ -185,6 +185,22 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         self.state.building().group_values.len()
     }
 
+    pub(in crate::aggregates) fn clear_building_shrink(
+        &mut self,
+        num_rows: usize,
+    ) -> Result<()> {
+        let state = self.state.building_mut();
+        state.group_values.clear_shrink(num_rows);
+        state.batch_group_indices.clear();
+        state.batch_group_indices.shrink_to(num_rows);
+        state.accumulators = state
+            .accumulators
+            .iter()
+            .map(HashAggregateAccumulator::empty_like)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
+
     pub(in crate::aggregates) fn is_building(&self) -> bool {
         matches!(self.state, AggregateHashTableState::Building(_))
     }

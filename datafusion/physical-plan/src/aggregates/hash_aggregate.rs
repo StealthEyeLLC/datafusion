@@ -100,6 +100,39 @@ struct MaterializeGroup {
     total_rows: usize,
 }
 
+struct FinalPartitionReuseProbe {
+    probe_rows_threshold: usize,
+    probe_ratio_threshold: f64,
+    input_rows: usize,
+}
+
+impl FinalPartitionReuseProbe {
+    fn new(probe_rows_threshold: usize, probe_ratio_threshold: f64) -> Self {
+        Self {
+            probe_rows_threshold,
+            probe_ratio_threshold,
+            input_rows: 0,
+        }
+    }
+
+    fn update_state(&mut self, input_rows: usize, num_groups: usize) -> Option<bool> {
+        self.input_rows += input_rows;
+        if self.input_rows < self.probe_rows_threshold {
+            return None;
+        }
+
+        let should_reuse =
+            num_groups as f64 / self.input_rows as f64 > self.probe_ratio_threshold;
+        Some(should_reuse)
+    }
+}
+
+enum FinalPartitionReuseMode {
+    Disabled,
+    Probing(FinalPartitionReuseProbe),
+    Enabled,
+}
+
 struct FinalPartitionRunState {
     buffered_batches: Vec<BufferedPartitionBatch>,
     staged_batches: BTreeMap<usize, Vec<RecordBatch>>,
@@ -129,6 +162,16 @@ impl FinalPartitionRunState {
 
     fn total_size(&self) -> usize {
         self.total_staged_size + self.total_buffered_size + self.replaying_size
+    }
+
+    fn clear_buffered_partitions(&mut self) {
+        self.buffered_batches.clear();
+        self.staged_batches.clear();
+        self.staged_sizes.clear();
+        self.total_staged_size = 0;
+        self.total_buffered_size = 0;
+        self.replaying_size = 0;
+        self.replaying_partition_id = None;
     }
 
     fn has_buffered_partitions(&self) -> bool {
@@ -513,6 +556,9 @@ pub(crate) struct FinalHashAggregateStream {
 
     /// Buffered final-partitioned runs replayed one aggregate partition at a time.
     partition_run_state: Option<FinalPartitionRunState>,
+
+    /// Probe state that decides whether partition-run reuse should be enabled.
+    partition_reuse_mode: FinalPartitionReuseMode,
 
     /// See comments for the same variable in [`PartialHashAggregateStream`].
     group_values_soft_limit: Option<usize>,
@@ -1082,13 +1128,28 @@ impl FinalHashAggregateStream {
             MemoryConsumer::new(format!("FinalHashAggregateStream[{partition}]"))
                 .register(context.memory_pool());
         let uses_partition_runs = agg.mode == super::AggregateMode::FinalPartitioned;
+        let options = &context.session_config().options().execution;
+        let probe_ratio_threshold =
+            options.skip_partial_aggregation_probe_ratio_threshold;
+        let partition_reuse_mode = if uses_partition_runs && probe_ratio_threshold < 1.0 {
+            FinalPartitionReuseMode::Probing(FinalPartitionReuseProbe::new(
+                options.skip_partial_aggregation_probe_rows_threshold,
+                probe_ratio_threshold,
+            ))
+        } else {
+            FinalPartitionReuseMode::Disabled
+        };
+        let partition_run_state =
+            (!matches!(partition_reuse_mode, FinalPartitionReuseMode::Disabled))
+                .then(FinalPartitionRunState::new);
 
         Ok(Self {
             schema,
             input,
             baseline_metrics,
             reservation,
-            partition_run_state: uses_partition_runs.then(FinalPartitionRunState::new),
+            partition_run_state,
+            partition_reuse_mode,
             group_values_soft_limit: agg.limit_options().map(|config| config.limit()),
             state: Some(FinalHashAggregateState::ReadingInput { hash_table }),
         })
@@ -1108,10 +1169,12 @@ impl FinalHashAggregateStream {
             .is_some_and(|limit| limit <= hash_table.building_group_count())
     }
 
-    fn should_buffer_partition_runs(&self) -> bool {
-        self.partition_run_state
-            .as_ref()
-            .is_some_and(|state| !state.is_draining)
+    fn should_stage_partition_runs(&self) -> bool {
+        !matches!(self.partition_reuse_mode, FinalPartitionReuseMode::Disabled)
+            && self
+                .partition_run_state
+                .as_ref()
+                .is_some_and(|state| !state.is_draining)
     }
 
     fn stage_partition_runs(&mut self, batch: &RecordBatch) -> Result<Option<usize>> {
@@ -1173,26 +1236,37 @@ impl FinalHashAggregateStream {
         Ok(Some(staged_memory))
     }
 
-    fn reserve_staged_partition_runs(
+    fn disable_partition_reuse(&mut self) {
+        if let Some(state) = self.partition_run_state.as_mut() {
+            state.clear_buffered_partitions();
+        }
+        self.partition_run_state = None;
+        self.partition_reuse_mode = FinalPartitionReuseMode::Disabled;
+    }
+
+    fn update_partition_reuse_probe(
         &mut self,
-        batch_memory: usize,
-        hash_table: &AggregateHashTable<FinalMarker>,
+        input_rows: usize,
+        hash_table: &mut AggregateHashTable<FinalMarker>,
     ) -> Result<()> {
-        if batch_memory == 0 {
+        let FinalPartitionReuseMode::Probing(probe) = &mut self.partition_reuse_mode
+        else {
             return Ok(());
+        };
+
+        let Some(should_reuse) =
+            probe.update_state(input_rows, hash_table.building_group_count())
+        else {
+            return Ok(());
+        };
+        let probe_rows = probe.input_rows;
+
+        if should_reuse {
+            hash_table.clear_building_shrink(probe_rows)?;
+            self.partition_reuse_mode = FinalPartitionReuseMode::Enabled;
+        } else {
+            self.disable_partition_reuse();
         }
-
-        let total_buffered_size = self
-            .partition_run_state
-            .as_ref()
-            .map(FinalPartitionRunState::total_size)
-            .unwrap_or(0);
-
-        if total_buffered_size == batch_memory {
-            return self.update_memory_reservation(Some(hash_table));
-        }
-
-        self.reservation.try_grow(batch_memory)?;
         Ok(())
     }
 
@@ -1366,33 +1440,36 @@ impl FinalHashAggregateStream {
                 let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
                 let timer = elapsed_compute.timer();
 
-                if self.should_buffer_partition_runs() {
-                    if original_state.hash_table().building_group_count() != 0 {
-                        timer.done();
-                        return ControlFlow::Break((
-                            Poll::Ready(Some(internal_err!(
-                                "cannot switch final partitioned aggregation to buffered runs after groups have already been accumulated"
-                            ))),
-                            original_state,
-                        ));
-                    }
-
+                let mut staged_partition_batch = false;
+                if self.should_stage_partition_runs() {
                     match self.stage_partition_runs(&batch) {
-                        Ok(Some(batch_memory)) => {
-                            let result = self.reserve_staged_partition_runs(
-                                batch_memory,
-                                original_state.hash_table(),
-                            );
-                            timer.done();
-                            if let Err(e) = result {
-                                return ControlFlow::Break((
-                                    Poll::Ready(Some(Err(e))),
-                                    original_state,
+                        Ok(Some(_)) => {
+                            staged_partition_batch = true;
+                            if matches!(
+                                self.partition_reuse_mode,
+                                FinalPartitionReuseMode::Enabled
+                            ) {
+                                let result = self.update_memory_reservation(Some(
+                                    original_state.hash_table(),
                                 ));
+                                timer.done();
+                                if let Err(e) = result {
+                                    return ControlFlow::Break((
+                                        Poll::Ready(Some(Err(e))),
+                                        original_state,
+                                    ));
+                                }
+                                return ControlFlow::Continue(original_state);
                             }
-                            return ControlFlow::Continue(original_state);
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            if matches!(
+                                self.partition_reuse_mode,
+                                FinalPartitionReuseMode::Probing(_)
+                            ) {
+                                self.disable_partition_reuse();
+                            }
+                        }
                         Err(e) => {
                             timer.done();
                             return ControlFlow::Break((
@@ -1403,7 +1480,21 @@ impl FinalHashAggregateStream {
                     }
                 }
 
+                let input_rows = batch.num_rows();
                 let result = original_state.hash_table_mut().aggregate_batch(&batch);
+                if result.is_ok() && staged_partition_batch {
+                    let result = self.update_partition_reuse_probe(
+                        input_rows,
+                        original_state.hash_table_mut(),
+                    );
+                    if let Err(e) = result {
+                        timer.done();
+                        return ControlFlow::Break((
+                            Poll::Ready(Some(Err(e))),
+                            original_state,
+                        ));
+                    }
+                }
                 timer.done();
 
                 if let Err(e) = result {
@@ -1445,11 +1536,23 @@ impl FinalHashAggregateStream {
             Poll::Ready(None) => {
                 let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
                 let timer = elapsed_compute.timer();
+                if matches!(
+                    self.partition_reuse_mode,
+                    FinalPartitionReuseMode::Probing(_)
+                ) {
+                    self.disable_partition_reuse();
+                }
                 let result = match self.partition_run_state.as_ref() {
                     Some(state) if state.is_draining => {
                         self.finish_partition_run_replay(original_state.into_hash_table())
                     }
-                    Some(state) if state.has_buffered_partitions() => {
+                    Some(state)
+                        if state.has_buffered_partitions()
+                            && matches!(
+                                self.partition_reuse_mode,
+                                FinalPartitionReuseMode::Enabled
+                            ) =>
+                    {
                         self.begin_partition_run_replay(original_state.into_hash_table())
                     }
                     _ => self
@@ -1682,7 +1785,18 @@ mod tests {
             Arc::clone(&schema),
         )?;
 
-        let task_ctx = Arc::new(TaskContext::default());
+        let mut task_ctx = TaskContext::default();
+        let mut session_config = task_ctx.session_config().clone();
+        session_config = session_config.set(
+            "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+            &datafusion_common::ScalarValue::UInt64(Some(1)),
+        );
+        session_config = session_config.set(
+            "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+            &datafusion_common::ScalarValue::Float64(Some(0.0)),
+        );
+        task_ctx = task_ctx.with_session_config(session_config);
+        let task_ctx = Arc::new(task_ctx);
         let mut stream = FinalHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
         let mut actual = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -1712,6 +1826,95 @@ mod tests {
                     |state| !state.has_buffered_partitions() && state.is_draining
                 )
         );
+
+        Ok(())
+    }
+
+    // Covers final partitioned hash aggregation disabling partition-run reuse
+    // when the probe observes a low distinct-group ratio.
+    // Example: two rows with one group do not cross a 0.9 reuse threshold.
+    #[tokio::test]
+    async fn test_final_hash_stream_partition_reuse_probe_disables_low_cardinality()
+    -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2, 3])) as ArrayRef,
+            ],
+        )?;
+        let input_batches = vec![append_subpartition_column(
+            &input_batch,
+            &[PartitionRun::new(0, 1)?, PartitionRun::new(1, 1)?],
+        )?];
+
+        let input_schema = subpartition_schema(&schema);
+        let input = TestMemoryExec::try_new_exec(&[input_batches], input_schema, None)?;
+        let input =
+            Arc::new(TestMemoryExec::update_cache(&input)) as Arc<dyn ExecutionPlan>;
+
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col("group_col", &schema)?,
+            "group_col".to_string(),
+        )]);
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(sum_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("SUM(value)")
+                .build()?,
+        )];
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by,
+            aggr_expr,
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        let mut task_ctx = TaskContext::default();
+        let mut session_config = task_ctx.session_config().clone();
+        session_config = session_config.set(
+            "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+            &datafusion_common::ScalarValue::UInt64(Some(1)),
+        );
+        session_config = session_config.set(
+            "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+            &datafusion_common::ScalarValue::Float64(Some(0.9)),
+        );
+        task_ctx = task_ctx.with_session_config(session_config);
+        let task_ctx = Arc::new(task_ctx);
+
+        let mut stream = FinalHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
+        let mut actual = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("group column should be Int32");
+            let sums = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("sum column should be Int64");
+            for row in 0..batch.num_rows() {
+                actual.push((groups.value(row), sums.value(row)));
+            }
+        }
+
+        assert_eq!(actual, vec![(1, 5)]);
+        assert!(matches!(
+            stream.partition_reuse_mode,
+            FinalPartitionReuseMode::Disabled
+        ));
+        assert!(stream.partition_run_state.is_none());
 
         Ok(())
     }
