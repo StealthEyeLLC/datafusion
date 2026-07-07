@@ -102,7 +102,6 @@ struct MaterializeGroup {
 
 struct CachedProbeBatch {
     batch: RecordBatch,
-    size: usize,
 }
 
 struct FinalPartitionReuseProbe {
@@ -125,9 +124,8 @@ impl FinalPartitionReuseProbe {
     }
 
     fn cache_batch(&mut self, batch: RecordBatch) {
-        let size = get_record_batch_memory_size(&batch);
-        self.cached_size += size;
-        self.cached_batches.push(CachedProbeBatch { batch, size });
+        self.cached_size += get_record_batch_memory_size(&batch);
+        self.cached_batches.push(CachedProbeBatch { batch });
     }
 
     fn cached_size(&self) -> usize {
@@ -164,7 +162,6 @@ struct FinalPartitionRunState {
     total_buffered_size: usize,
     replaying_size: usize,
     replaying_partition_id: Option<usize>,
-    is_draining: bool,
     schema: Option<SchemaRef>,
 }
 
@@ -178,7 +175,6 @@ impl FinalPartitionRunState {
             total_buffered_size: 0,
             replaying_size: 0,
             replaying_partition_id: None,
-            is_draining: false,
             schema: None,
         }
     }
@@ -335,11 +331,6 @@ impl FinalPartitionRunState {
         self.buffered_batches.clear();
         self.total_buffered_size = 0;
         Ok(())
-    }
-
-    fn begin_replay(&mut self) -> Result<()> {
-        self.is_draining = true;
-        self.flush_buffered_batches()
     }
 
     fn finish_replaying_run(&mut self) {
@@ -601,9 +592,17 @@ enum FinalHashAggregateState {
     StagingCachedInput {
         hash_table: AggregateHashTable<FinalMarker>,
         cached_batches: std::vec::IntoIter<CachedProbeBatch>,
-        remaining_cached_size: usize,
+    },
+    StagingInput {
+        hash_table: AggregateHashTable<FinalMarker>,
+    },
+    ReadingPartitionRun {
+        hash_table: AggregateHashTable<FinalMarker>,
     },
     ProducingOutput {
+        hash_table: AggregateHashTable<FinalMarker>,
+    },
+    ProducingPartitionOutput {
         hash_table: AggregateHashTable<FinalMarker>,
     },
     Done,
@@ -620,7 +619,10 @@ impl FinalHashAggregateState {
         match self {
             Self::ReadingInput { hash_table }
             | Self::StagingCachedInput { hash_table, .. }
-            | Self::ProducingOutput { hash_table } => hash_table,
+            | Self::StagingInput { hash_table }
+            | Self::ReadingPartitionRun { hash_table }
+            | Self::ProducingOutput { hash_table }
+            | Self::ProducingPartitionOutput { hash_table } => hash_table,
             Self::Done => unreachable!("Done state does not hold a hash table"),
         }
     }
@@ -629,7 +631,10 @@ impl FinalHashAggregateState {
         match self {
             Self::ReadingInput { hash_table }
             | Self::StagingCachedInput { hash_table, .. }
-            | Self::ProducingOutput { hash_table } => hash_table,
+            | Self::StagingInput { hash_table }
+            | Self::ReadingPartitionRun { hash_table }
+            | Self::ProducingOutput { hash_table }
+            | Self::ProducingPartitionOutput { hash_table } => hash_table,
             Self::Done => unreachable!("Done state does not hold a hash table"),
         }
     }
@@ -638,7 +643,10 @@ impl FinalHashAggregateState {
         match self {
             Self::ReadingInput { hash_table }
             | Self::StagingCachedInput { hash_table, .. }
-            | Self::ProducingOutput { hash_table } => hash_table,
+            | Self::StagingInput { hash_table }
+            | Self::ReadingPartitionRun { hash_table }
+            | Self::ProducingOutput { hash_table }
+            | Self::ProducingPartitionOutput { hash_table } => hash_table,
             Self::Done => unreachable!("Done state does not hold a hash table"),
         }
     }
@@ -1187,21 +1195,13 @@ impl FinalHashAggregateStream {
         if self
             .partition_run_state
             .as_ref()
-            .is_some_and(|state| state.is_draining || state.has_buffered_partitions())
+            .is_some_and(FinalPartitionRunState::has_buffered_partitions)
         {
             return false;
         }
 
         self.group_values_soft_limit
             .is_some_and(|limit| limit <= hash_table.building_group_count())
-    }
-
-    fn should_stage_partition_runs(&self) -> bool {
-        matches!(self.partition_reuse_mode, FinalPartitionReuseMode::Enabled)
-            && self
-                .partition_run_state
-                .as_ref()
-                .is_some_and(|state| !state.is_draining)
     }
 
     fn stage_partition_runs(&mut self, batch: &RecordBatch) -> Result<Option<usize>> {
@@ -1309,46 +1309,6 @@ impl FinalHashAggregateStream {
         }
     }
 
-    fn begin_partition_run_replay(
-        &mut self,
-        hash_table: AggregateHashTable<FinalMarker>,
-    ) -> Result<FinalHashAggregateState> {
-        if let Some(state) = self.partition_run_state.as_mut() {
-            state.begin_replay()?;
-        }
-
-        self.load_next_partition_run(hash_table)
-    }
-
-    fn finish_partition_run_replay(
-        &mut self,
-        mut hash_table: AggregateHashTable<FinalMarker>,
-    ) -> Result<FinalHashAggregateState> {
-        self.start_output(&mut hash_table)?;
-
-        if let Some(state) = self.partition_run_state.as_mut() {
-            state.finish_replaying_run();
-        }
-
-        self.update_memory_reservation(Some(&hash_table))?;
-        Ok(FinalHashAggregateState::ProducingOutput { hash_table })
-    }
-
-    fn next_state_after_partition_output(
-        &mut self,
-        hash_table: AggregateHashTable<FinalMarker>,
-    ) -> Result<FinalHashAggregateState> {
-        if !self
-            .partition_run_state
-            .as_ref()
-            .is_some_and(|state| state.is_draining)
-        {
-            return Ok(FinalHashAggregateState::Done);
-        }
-
-        self.load_next_partition_run(hash_table)
-    }
-
     fn load_next_partition_run(
         &mut self,
         hash_table: AggregateHashTable<FinalMarker>,
@@ -1358,34 +1318,34 @@ impl FinalHashAggregateStream {
             .as_ref()
             .and_then(FinalPartitionRunState::next_partition_id);
 
-        if let Some(partition_id) = next_partition_id {
-            let batches = self
-                .partition_run_state
-                .as_mut()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "missing partition run state while replaying final aggregate runs"
-                            .to_string(),
-                    )
-                })?
-                .take_run(partition_id)?;
-            let schema = batches.first().map(|batch| batch.schema()).ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "Staged batches for final aggregate partition {partition_id} were unexpectedly empty"
-                ))
-            })?;
-            self.input = Box::pin(BucketStream {
-                schema,
-                iter: batches.into_iter(),
-            });
-            self.update_memory_reservation(Some(&hash_table))?;
-            Ok(FinalHashAggregateState::ReadingInput { hash_table })
-        } else {
+        let Some(partition_id) = next_partition_id else {
             let input_schema = self.input.schema();
             self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
             self.update_memory_reservation(None)?;
-            Ok(FinalHashAggregateState::Done)
-        }
+            return Ok(FinalHashAggregateState::Done);
+        };
+
+        let batches = self
+            .partition_run_state
+            .as_mut()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "missing partition run state while replaying final aggregate runs"
+                        .to_string(),
+                )
+            })?
+            .take_run(partition_id)?;
+        let schema = batches.first().map(|batch| batch.schema()).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "Staged batches for final aggregate partition {partition_id} were unexpectedly empty"
+            ))
+        })?;
+        self.input = Box::pin(BucketStream {
+            schema,
+            iter: batches.into_iter(),
+        });
+        self.update_memory_reservation(Some(&hash_table))?;
+        Ok(FinalHashAggregateState::ReadingPartitionRun { hash_table })
     }
 
     fn update_memory_reservation(
@@ -1419,63 +1379,27 @@ impl FinalHashAggregateStream {
     }
 
     // FinalPartitioned inputs arrive with an internal subpartition column. The
-    // rows can contain multiple relative partitions in one output stream.
+    // reuse path is entered only after the probe decides it is profitable. The
+    // normal `ReadingInput` state then switches into these dedicated states:
     //
-    // Original input stream:
+    //   ReadingInput
+    //     + probe rejects reuse -> keep normal aggregation
+    //     + probe accepts reuse -> clear probe hash table, StagingCachedInput
     //
-    //   batch A rows: [ p0 ][ p1 ]       hidden column: [p0, ..., p1, ...]
-    //   batch B rows: [ p0 ][ p1 ]       hidden column: [p0, ..., p1, ...]
+    //   StagingCachedInput
+    //     + cached probe batch -> stage rows by hidden subpartition
+    //     + cached input done  -> StagingInput
     //
-    // Copy rows into one coalescer per relative aggregate partition while
-    // reading the original stream:
+    //   StagingInput
+    //     + original input batch -> stage rows by hidden subpartition
+    //     + original input done  -> ReadingPartitionRun(p0)
     //
-    //   FinalPartitionRunState.coalescers
-    //   +----+-----------------------------+
-    //   | p0 | coalescer(A.p0, B.p0, ...)  |
-    //   | p1 | coalescer(A.p1, B.p1, ...)  |
-    //   +----+-----------------------------+
+    //   ReadingPartitionRun(pN)
+    //     + staged batch -> aggregate into final hash table
+    //     + partition done -> ProducingPartitionOutput(pN)
     //
-    // Replay after the original stream ends:
-    //
-    //   p0 coalescer batches -> fresh final hash table -> output p0 groups
-    //   p1 coalescer batches -> fresh final hash table -> output p1 groups
-    //
-    // This keeps equal group keys from different relative aggregate partitions from
-    // being merged together, while still merging the same group key within one
-    // relative aggregate partition.
-    //
-    // State transitions:
-    //
-    //   Reading original input
-    //     + hidden column    -> buffer rows, keep ReadingInput
-    //     + no hidden column -> normal aggregate_batch path
-    //     + input done  -> begin_partition_run_replay(...)
-    //
-    //   Reading BucketStream(pN)
-    //     + input done  -> finish_partition_run_replay(...) -> ProducingOutput(pN)
-    //
-    //   ProducingOutput(pN)
-    //     + output done -> load_next_partition_run(fresh table) or Done
-    //
-    /// Handle ReadingInput state - aggregate partial state batches into the hash table.
-    ///
-    /// See comments at `poll_next()` for details.
-    ///
-    /// Returns the next operator state with control flow decision.
-    fn start_staging_cached_input(
-        &mut self,
-        hash_table: AggregateHashTable<FinalMarker>,
-        cached_batches: Vec<CachedProbeBatch>,
-        cached_size: usize,
-    ) -> Result<FinalHashAggregateState> {
-        self.update_memory_reservation(Some(&hash_table))?;
-        Ok(FinalHashAggregateState::StagingCachedInput {
-            hash_table,
-            cached_batches: cached_batches.into_iter(),
-            remaining_cached_size: cached_size,
-        })
-    }
-
+    //   ProducingPartitionOutput(pN)
+    //     + output done -> ReadingPartitionRun(pN+1) or Done
     /// Handle ReadingInput state - aggregate partial state batches into the hash table.
     ///
     /// See comments at `poll_next()` for details.
@@ -1497,32 +1421,6 @@ impl FinalHashAggregateStream {
             Poll::Ready(Some(Ok(batch))) => {
                 let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
                 let timer = elapsed_compute.timer();
-
-                if self.should_stage_partition_runs() {
-                    match self.stage_partition_runs(&batch) {
-                        Ok(Some(_)) => {
-                            let result = self.update_memory_reservation(Some(
-                                original_state.hash_table(),
-                            ));
-                            timer.done();
-                            if let Err(e) = result {
-                                return ControlFlow::Break((
-                                    Poll::Ready(Some(Err(e))),
-                                    original_state,
-                                ));
-                            }
-                            return ControlFlow::Continue(original_state);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            timer.done();
-                            return ControlFlow::Break((
-                                Poll::Ready(Some(Err(e))),
-                                original_state,
-                            ));
-                        }
-                    }
-                }
 
                 let input_rows = batch.num_rows();
                 let is_probing = matches!(
@@ -1559,19 +1457,20 @@ impl FinalHashAggregateStream {
                     ));
                 }
 
-                if let Some((cached_batches, cached_size)) = cached_state {
+                if let Some((cached_batches, _cached_size)) = cached_state {
                     let hash_table = original_state.into_hash_table();
-                    return match self.start_staging_cached_input(
-                        hash_table,
-                        cached_batches,
-                        cached_size,
-                    ) {
-                        Ok(next_state) => ControlFlow::Continue(next_state),
-                        Err(e) => ControlFlow::Break((
+                    if let Err(e) = self.update_memory_reservation(Some(&hash_table)) {
+                        return ControlFlow::Break((
                             Poll::Ready(Some(Err(e))),
                             FinalHashAggregateState::Done,
-                        )),
-                    };
+                        ));
+                    }
+                    return ControlFlow::Continue(
+                        FinalHashAggregateState::StagingCachedInput {
+                            hash_table,
+                            cached_batches: cached_batches.into_iter(),
+                        },
+                    );
                 }
 
                 if self.hit_soft_group_limit(original_state.hash_table()) {
@@ -1612,23 +1511,9 @@ impl FinalHashAggregateStream {
                 ) {
                     self.disable_partition_reuse();
                 }
-                let result = match self.partition_run_state.as_ref() {
-                    Some(state) if state.is_draining => {
-                        self.finish_partition_run_replay(original_state.into_hash_table())
-                    }
-                    Some(state)
-                        if state.has_buffered_partitions()
-                            && matches!(
-                                self.partition_reuse_mode,
-                                FinalPartitionReuseMode::Enabled
-                            ) =>
-                    {
-                        self.begin_partition_run_replay(original_state.into_hash_table())
-                    }
-                    _ => self
-                        .start_output(original_state.hash_table_mut())
-                        .map(|()| original_state.into_producing_output()),
-                };
+                let result = self
+                    .start_output(original_state.hash_table_mut())
+                    .map(|()| original_state.into_producing_output());
                 timer.done();
 
                 match result {
@@ -1655,7 +1540,6 @@ impl FinalHashAggregateStream {
         let FinalHashAggregateState::StagingCachedInput {
             hash_table,
             mut cached_batches,
-            remaining_cached_size,
         } = original_state
         else {
             unreachable!("expected staging cached input state")
@@ -1673,8 +1557,6 @@ impl FinalHashAggregateStream {
                         let next_state = FinalHashAggregateState::StagingCachedInput {
                             hash_table,
                             cached_batches,
-                            remaining_cached_size: remaining_cached_size
-                                .saturating_sub(cached_batch.size),
                         };
                         if let Err(e) =
                             self.update_memory_reservation(Some(next_state.hash_table()))
@@ -1698,9 +1580,156 @@ impl FinalHashAggregateStream {
                     )),
                 }
             }
-            None => ControlFlow::Continue(FinalHashAggregateState::ReadingInput {
+            None => ControlFlow::Continue(FinalHashAggregateState::StagingInput {
                 hash_table,
             }),
+        }
+    }
+
+    fn handle_staging_input(
+        &mut self,
+        cx: &mut Context<'_>,
+        original_state: FinalHashAggregateState,
+    ) -> FinalHashAggregateStateTransition {
+        debug_assert!(matches!(
+            &original_state,
+            FinalHashAggregateState::StagingInput { .. }
+        ));
+        debug_assert!(original_state.hash_table().is_building());
+
+        let FinalHashAggregateState::StagingInput { hash_table } = original_state else {
+            unreachable!("expected staging input state")
+        };
+
+        match self.input.poll_next_unpin(cx) {
+            Poll::Pending => ControlFlow::Break((
+                Poll::Pending,
+                FinalHashAggregateState::StagingInput { hash_table },
+            )),
+            Poll::Ready(Some(Ok(batch))) => {
+                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                let timer = elapsed_compute.timer();
+                let result = self.stage_partition_runs(&batch);
+                timer.done();
+
+                match result {
+                    Ok(Some(_)) => {
+                        let next_state =
+                            FinalHashAggregateState::StagingInput { hash_table };
+                        if let Err(e) =
+                            self.update_memory_reservation(Some(next_state.hash_table()))
+                        {
+                            return ControlFlow::Break((
+                                Poll::Ready(Some(Err(e))),
+                                next_state,
+                            ));
+                        }
+                        ControlFlow::Continue(next_state)
+                    }
+                    Ok(None) => ControlFlow::Break((
+                        Poll::Ready(Some(internal_err!(
+                            "final partition reuse input batch is missing subpartition column"
+                        ))),
+                        FinalHashAggregateState::Done,
+                    )),
+                    Err(e) => ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        FinalHashAggregateState::Done,
+                    )),
+                }
+            }
+            Poll::Ready(Some(Err(e))) => ControlFlow::Break((
+                Poll::Ready(Some(Err(e))),
+                FinalHashAggregateState::StagingInput { hash_table },
+            )),
+            Poll::Ready(None) => {
+                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                let timer = elapsed_compute.timer();
+                let result = self
+                    .partition_run_state
+                    .as_mut()
+                    .map(FinalPartitionRunState::flush_buffered_batches)
+                    .transpose()
+                    .and_then(|_| self.load_next_partition_run(hash_table));
+                timer.done();
+
+                match result {
+                    Ok(next_state) => ControlFlow::Continue(next_state),
+                    Err(e) => ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        FinalHashAggregateState::Done,
+                    )),
+                }
+            }
+        }
+    }
+
+    fn handle_reading_partition_run(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut original_state: FinalHashAggregateState,
+    ) -> FinalHashAggregateStateTransition {
+        debug_assert!(matches!(
+            &original_state,
+            FinalHashAggregateState::ReadingPartitionRun { .. }
+        ));
+        debug_assert!(original_state.hash_table().is_building());
+
+        match self.input.poll_next_unpin(cx) {
+            Poll::Pending => ControlFlow::Break((Poll::Pending, original_state)),
+            Poll::Ready(Some(Ok(batch))) => {
+                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                let timer = elapsed_compute.timer();
+                let result = original_state.hash_table_mut().aggregate_batch(&batch);
+                timer.done();
+
+                if let Err(e) = result {
+                    return ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        original_state,
+                    ));
+                }
+
+                if let Err(e) =
+                    self.update_memory_reservation(Some(original_state.hash_table()))
+                {
+                    return ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        original_state,
+                    ));
+                }
+
+                ControlFlow::Continue(original_state)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                ControlFlow::Break((Poll::Ready(Some(Err(e))), original_state))
+            }
+            Poll::Ready(None) => {
+                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                let timer = elapsed_compute.timer();
+                let result = self.start_output(original_state.hash_table_mut());
+                if result.is_ok()
+                    && let Some(state) = self.partition_run_state.as_mut()
+                {
+                    state.finish_replaying_run();
+                }
+                let result = result.and_then(|()| {
+                    self.update_memory_reservation(Some(original_state.hash_table()))
+                });
+                timer.done();
+
+                match result {
+                    Ok(()) => ControlFlow::Continue(
+                        FinalHashAggregateState::ProducingPartitionOutput {
+                            hash_table: original_state.into_hash_table(),
+                        },
+                    ),
+                    Err(e) => ControlFlow::Break((
+                        Poll::Ready(Some(Err(e))),
+                        FinalHashAggregateState::Done,
+                    )),
+                }
+            }
         }
     }
 
@@ -1716,8 +1745,13 @@ impl FinalHashAggregateStream {
         debug_assert!(matches!(
             &original_state,
             FinalHashAggregateState::ProducingOutput { .. }
+                | FinalHashAggregateState::ProducingPartitionOutput { .. }
         ));
         debug_assert!(!original_state.hash_table().is_building());
+        let is_partition_output = matches!(
+            original_state,
+            FinalHashAggregateState::ProducingPartitionOutput { .. }
+        );
 
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
         let timer = elapsed_compute.timer();
@@ -1730,16 +1764,20 @@ impl FinalHashAggregateStream {
                 let next_state = if original_state.hash_table().is_done()
                     || original_state.hash_table().is_building()
                 {
-                    match self.next_state_after_partition_output(
-                        original_state.into_hash_table(),
-                    ) {
-                        Ok(next_state) => next_state,
-                        Err(e) => {
-                            return ControlFlow::Break((
-                                Poll::Ready(Some(Err(e))),
-                                FinalHashAggregateState::Done,
-                            ));
+                    if is_partition_output {
+                        match self
+                            .load_next_partition_run(original_state.into_hash_table())
+                        {
+                            Ok(next_state) => next_state,
+                            Err(e) => {
+                                return ControlFlow::Break((
+                                    Poll::Ready(Some(Err(e))),
+                                    FinalHashAggregateState::Done,
+                                ));
+                            }
                         }
+                    } else {
+                        FinalHashAggregateState::Done
                     }
                 } else {
                     let _ =
@@ -1813,7 +1851,14 @@ impl Stream for FinalHashAggregateStream {
                 state @ FinalHashAggregateState::StagingCachedInput { .. } => {
                     self.handle_staging_cached_input(state)
                 }
-                state @ FinalHashAggregateState::ProducingOutput { .. } => {
+                state @ FinalHashAggregateState::StagingInput { .. } => {
+                    self.handle_staging_input(cx, state)
+                }
+                state @ FinalHashAggregateState::ReadingPartitionRun { .. } => {
+                    self.handle_reading_partition_run(cx, state)
+                }
+                state @ FinalHashAggregateState::ProducingOutput { .. }
+                | state @ FinalHashAggregateState::ProducingPartitionOutput { .. } => {
                     self.handle_producing_output(state)
                 }
                 state @ FinalHashAggregateState::Done => {
@@ -1957,9 +2002,7 @@ mod tests {
             stream
                 .partition_run_state
                 .as_ref()
-                .is_some_and(
-                    |state| !state.has_buffered_partitions() && state.is_draining
-                )
+                .is_some_and(|state| !state.has_buffered_partitions())
         );
 
         Ok(())
