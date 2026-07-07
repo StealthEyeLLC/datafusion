@@ -585,16 +585,18 @@ pub(crate) struct FinalHashAggregateStream {
 /// States for final hash aggregation processing.
 // The typestate pattern is used in case the inner logic becomes more complex in
 // the future.
+enum FinalPartitionRunStagingSource {
+    Cached(std::vec::IntoIter<CachedProbeBatch>),
+    Input,
+}
+
 enum FinalHashAggregateState {
     ReadingInput {
         hash_table: AggregateHashTable<FinalMarker>,
     },
-    StagingCachedInput {
+    StagingPartitionRuns {
         hash_table: AggregateHashTable<FinalMarker>,
-        cached_batches: std::vec::IntoIter<CachedProbeBatch>,
-    },
-    StagingInput {
-        hash_table: AggregateHashTable<FinalMarker>,
+        source: FinalPartitionRunStagingSource,
     },
     ReadingPartitionRun {
         hash_table: AggregateHashTable<FinalMarker>,
@@ -618,8 +620,7 @@ impl FinalHashAggregateState {
     fn hash_table(&self) -> &AggregateHashTable<FinalMarker> {
         match self {
             Self::ReadingInput { hash_table }
-            | Self::StagingCachedInput { hash_table, .. }
-            | Self::StagingInput { hash_table }
+            | Self::StagingPartitionRuns { hash_table, .. }
             | Self::ReadingPartitionRun { hash_table }
             | Self::ProducingOutput { hash_table }
             | Self::ProducingPartitionOutput { hash_table } => hash_table,
@@ -630,8 +631,7 @@ impl FinalHashAggregateState {
     fn hash_table_mut(&mut self) -> &mut AggregateHashTable<FinalMarker> {
         match self {
             Self::ReadingInput { hash_table }
-            | Self::StagingCachedInput { hash_table, .. }
-            | Self::StagingInput { hash_table }
+            | Self::StagingPartitionRuns { hash_table, .. }
             | Self::ReadingPartitionRun { hash_table }
             | Self::ProducingOutput { hash_table }
             | Self::ProducingPartitionOutput { hash_table } => hash_table,
@@ -642,8 +642,7 @@ impl FinalHashAggregateState {
     fn into_hash_table(self) -> AggregateHashTable<FinalMarker> {
         match self {
             Self::ReadingInput { hash_table }
-            | Self::StagingCachedInput { hash_table, .. }
-            | Self::StagingInput { hash_table }
+            | Self::StagingPartitionRuns { hash_table, .. }
             | Self::ReadingPartitionRun { hash_table }
             | Self::ProducingOutput { hash_table }
             | Self::ProducingPartitionOutput { hash_table } => hash_table,
@@ -1384,15 +1383,12 @@ impl FinalHashAggregateStream {
     //
     //   ReadingInput
     //     + probe rejects reuse -> keep normal aggregation
-    //     + probe accepts reuse -> clear probe hash table, StagingCachedInput
+    //     + probe accepts reuse -> clear probe hash table, StagingPartitionRuns
     //
-    //   StagingCachedInput
+    //   StagingPartitionRuns
     //     + cached probe batch -> stage rows by hidden subpartition
-    //     + cached input done  -> StagingInput
-    //
-    //   StagingInput
-    //     + original input batch -> stage rows by hidden subpartition
-    //     + original input done  -> ReadingPartitionRun(p0)
+    //     + cached input done  -> keep staging from original input
+    //     + original input done -> ReadingPartitionRun(p0)
     //
     //   ReadingPartitionRun(pN)
     //     + staged batch -> aggregate into final hash table
@@ -1466,9 +1462,11 @@ impl FinalHashAggregateStream {
                         ));
                     }
                     return ControlFlow::Continue(
-                        FinalHashAggregateState::StagingCachedInput {
+                        FinalHashAggregateState::StagingPartitionRuns {
                             hash_table,
-                            cached_batches: cached_batches.into_iter(),
+                            source: FinalPartitionRunStagingSource::Cached(
+                                cached_batches.into_iter(),
+                            ),
                         },
                     );
                 }
@@ -1527,140 +1525,137 @@ impl FinalHashAggregateStream {
         }
     }
 
-    fn handle_staging_cached_input(
-        &mut self,
-        original_state: FinalHashAggregateState,
-    ) -> FinalHashAggregateStateTransition {
-        debug_assert!(matches!(
-            &original_state,
-            FinalHashAggregateState::StagingCachedInput { .. }
-        ));
-        debug_assert!(original_state.hash_table().is_building());
-
-        let FinalHashAggregateState::StagingCachedInput {
-            hash_table,
-            mut cached_batches,
-        } = original_state
-        else {
-            unreachable!("expected staging cached input state")
-        };
-
-        match cached_batches.next() {
-            Some(cached_batch) => {
-                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
-                let timer = elapsed_compute.timer();
-                let result = self.stage_partition_runs(&cached_batch.batch);
-                timer.done();
-
-                match result {
-                    Ok(Some(_)) => {
-                        let next_state = FinalHashAggregateState::StagingCachedInput {
-                            hash_table,
-                            cached_batches,
-                        };
-                        if let Err(e) =
-                            self.update_memory_reservation(Some(next_state.hash_table()))
-                        {
-                            return ControlFlow::Break((
-                                Poll::Ready(Some(Err(e))),
-                                next_state,
-                            ));
-                        }
-                        ControlFlow::Continue(next_state)
-                    }
-                    Ok(None) => ControlFlow::Break((
-                        Poll::Ready(Some(internal_err!(
-                            "cached final partition reuse probe batch is missing subpartition column"
-                        ))),
-                        FinalHashAggregateState::Done,
-                    )),
-                    Err(e) => ControlFlow::Break((
-                        Poll::Ready(Some(Err(e))),
-                        FinalHashAggregateState::Done,
-                    )),
-                }
-            }
-            None => ControlFlow::Continue(FinalHashAggregateState::StagingInput {
-                hash_table,
-            }),
-        }
-    }
-
-    fn handle_staging_input(
+    fn handle_staging_partition_runs(
         &mut self,
         cx: &mut Context<'_>,
         original_state: FinalHashAggregateState,
     ) -> FinalHashAggregateStateTransition {
         debug_assert!(matches!(
             &original_state,
-            FinalHashAggregateState::StagingInput { .. }
+            FinalHashAggregateState::StagingPartitionRuns { .. }
         ));
         debug_assert!(original_state.hash_table().is_building());
 
-        let FinalHashAggregateState::StagingInput { hash_table } = original_state else {
-            unreachable!("expected staging input state")
+        let FinalHashAggregateState::StagingPartitionRuns {
+            hash_table,
+            mut source,
+        } = original_state
+        else {
+            unreachable!("expected staging partition runs state")
         };
 
-        match self.input.poll_next_unpin(cx) {
-            Poll::Pending => ControlFlow::Break((
-                Poll::Pending,
-                FinalHashAggregateState::StagingInput { hash_table },
-            )),
-            Poll::Ready(Some(Ok(batch))) => {
-                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
-                let timer = elapsed_compute.timer();
-                let result = self.stage_partition_runs(&batch);
-                timer.done();
+        match &mut source {
+            FinalPartitionRunStagingSource::Cached(cached_batches) => {
+                match cached_batches.next() {
+                    Some(cached_batch) => {
+                        let elapsed_compute =
+                            self.baseline_metrics.elapsed_compute().clone();
+                        let timer = elapsed_compute.timer();
+                        let result = self.stage_partition_runs(&cached_batch.batch);
+                        timer.done();
 
-                match result {
-                    Ok(Some(_)) => {
-                        let next_state =
-                            FinalHashAggregateState::StagingInput { hash_table };
-                        if let Err(e) =
-                            self.update_memory_reservation(Some(next_state.hash_table()))
-                        {
-                            return ControlFlow::Break((
+                        match result {
+                            Ok(Some(_)) => {
+                                let next_state =
+                                    FinalHashAggregateState::StagingPartitionRuns {
+                                        hash_table,
+                                        source,
+                                    };
+                                if let Err(e) = self.update_memory_reservation(Some(
+                                    next_state.hash_table(),
+                                )) {
+                                    return ControlFlow::Break((
+                                        Poll::Ready(Some(Err(e))),
+                                        next_state,
+                                    ));
+                                }
+                                ControlFlow::Continue(next_state)
+                            }
+                            Ok(None) => ControlFlow::Break((
+                                Poll::Ready(Some(internal_err!(
+                                    "cached final partition reuse probe batch is missing subpartition column"
+                                ))),
+                                FinalHashAggregateState::Done,
+                            )),
+                            Err(e) => ControlFlow::Break((
                                 Poll::Ready(Some(Err(e))),
-                                next_state,
-                            ));
+                                FinalHashAggregateState::Done,
+                            )),
                         }
-                        ControlFlow::Continue(next_state)
                     }
-                    Ok(None) => ControlFlow::Break((
-                        Poll::Ready(Some(internal_err!(
-                            "final partition reuse input batch is missing subpartition column"
-                        ))),
-                        FinalHashAggregateState::Done,
-                    )),
-                    Err(e) => ControlFlow::Break((
-                        Poll::Ready(Some(Err(e))),
-                        FinalHashAggregateState::Done,
-                    )),
+                    None => ControlFlow::Continue(
+                        FinalHashAggregateState::StagingPartitionRuns {
+                            hash_table,
+                            source: FinalPartitionRunStagingSource::Input,
+                        },
+                    ),
                 }
             }
-            Poll::Ready(Some(Err(e))) => ControlFlow::Break((
-                Poll::Ready(Some(Err(e))),
-                FinalHashAggregateState::StagingInput { hash_table },
-            )),
-            Poll::Ready(None) => {
-                let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
-                let timer = elapsed_compute.timer();
-                let result = self
-                    .partition_run_state
-                    .as_mut()
-                    .map(FinalPartitionRunState::flush_buffered_batches)
-                    .transpose()
-                    .and_then(|_| self.load_next_partition_run(hash_table));
-                timer.done();
+            FinalPartitionRunStagingSource::Input => match self.input.poll_next_unpin(cx)
+            {
+                Poll::Pending => ControlFlow::Break((
+                    Poll::Pending,
+                    FinalHashAggregateState::StagingPartitionRuns { hash_table, source },
+                )),
+                Poll::Ready(Some(Ok(batch))) => {
+                    let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                    let timer = elapsed_compute.timer();
+                    let result = self.stage_partition_runs(&batch);
+                    timer.done();
 
-                match result {
-                    Ok(next_state) => ControlFlow::Continue(next_state),
-                    Err(e) => ControlFlow::Break((
-                        Poll::Ready(Some(Err(e))),
-                        FinalHashAggregateState::Done,
-                    )),
+                    match result {
+                        Ok(Some(_)) => {
+                            let next_state =
+                                FinalHashAggregateState::StagingPartitionRuns {
+                                    hash_table,
+                                    source,
+                                };
+                            if let Err(e) = self
+                                .update_memory_reservation(Some(next_state.hash_table()))
+                            {
+                                return ControlFlow::Break((
+                                    Poll::Ready(Some(Err(e))),
+                                    next_state,
+                                ));
+                            }
+                            ControlFlow::Continue(next_state)
+                        }
+                        Ok(None) => ControlFlow::Break((
+                            Poll::Ready(Some(internal_err!(
+                                "final partition reuse input batch is missing subpartition column"
+                            ))),
+                            FinalHashAggregateState::Done,
+                        )),
+                        Err(e) => ControlFlow::Break((
+                            Poll::Ready(Some(Err(e))),
+                            FinalHashAggregateState::Done,
+                        )),
+                    }
                 }
-            }
+                Poll::Ready(Some(Err(e))) => ControlFlow::Break((
+                    Poll::Ready(Some(Err(e))),
+                    FinalHashAggregateState::StagingPartitionRuns { hash_table, source },
+                )),
+                Poll::Ready(None) => {
+                    let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
+                    let timer = elapsed_compute.timer();
+                    let result = self
+                        .partition_run_state
+                        .as_mut()
+                        .map(FinalPartitionRunState::flush_buffered_batches)
+                        .transpose()
+                        .and_then(|_| self.load_next_partition_run(hash_table));
+                    timer.done();
+
+                    match result {
+                        Ok(next_state) => ControlFlow::Continue(next_state),
+                        Err(e) => ControlFlow::Break((
+                            Poll::Ready(Some(Err(e))),
+                            FinalHashAggregateState::Done,
+                        )),
+                    }
+                }
+            },
         }
     }
 
@@ -1848,11 +1843,8 @@ impl Stream for FinalHashAggregateStream {
                 state @ FinalHashAggregateState::ReadingInput { .. } => {
                     self.handle_reading_input(cx, state)
                 }
-                state @ FinalHashAggregateState::StagingCachedInput { .. } => {
-                    self.handle_staging_cached_input(state)
-                }
-                state @ FinalHashAggregateState::StagingInput { .. } => {
-                    self.handle_staging_input(cx, state)
+                state @ FinalHashAggregateState::StagingPartitionRuns { .. } => {
+                    self.handle_staging_partition_runs(cx, state)
                 }
                 state @ FinalHashAggregateState::ReadingPartitionRun { .. } => {
                     self.handle_reading_partition_run(cx, state)
