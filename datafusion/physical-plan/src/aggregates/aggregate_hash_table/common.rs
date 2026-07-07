@@ -190,7 +190,8 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         num_rows: usize,
     ) -> Result<()> {
         let state = self.state.building_mut();
-        state.group_values.clear_shrink(num_rows);
+        let group_schema = state.group_by.group_schema(&self.input_schema)?;
+        state.group_values = new_group_values(group_schema, &GroupOrdering::None)?;
         state.batch_group_indices.clear();
         state.batch_group_indices.shrink_to(num_rows);
         state.accumulators = state

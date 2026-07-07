@@ -1719,7 +1719,7 @@ mod tests {
     use crate::execution_plan::ExecutionPlan;
     use crate::test::TestMemoryExec;
 
-    use arrow::array::{ArrayRef, Int32Array, Int64Array};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringViewArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::Result;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
@@ -1825,6 +1825,85 @@ mod tests {
                     |state| !state.has_buffered_partitions() && state.is_draining
                 )
         );
+
+        Ok(())
+    }
+
+    // Covers final partitioned hash aggregation replay after the probe has
+    // flushed its materialization window for string group keys.
+    // Example: 17 input batches force one window flush before replay.
+    #[tokio::test]
+    async fn test_final_hash_stream_partition_reuse_probe_replays_flushed_string_runs()
+    -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Utf8View, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let mut input_batches = Vec::new();
+        for batch_idx in 0..17 {
+            let groups = (0..128)
+                .map(|row_idx| format!("url_{batch_idx}_{row_idx}"))
+                .collect::<Vec<_>>();
+            let values = vec![1_i64; groups.len()];
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringViewArray::from_iter_values(groups.iter()))
+                        as ArrayRef,
+                    Arc::new(Int64Array::from(values)) as ArrayRef,
+                ],
+            )?;
+            input_batches.push(append_subpartition_column(
+                &batch,
+                &[PartitionRun::new(0, 64)?, PartitionRun::new(1, 64)?],
+            )?);
+        }
+
+        let input_schema = subpartition_schema(&schema);
+        let input = TestMemoryExec::try_new_exec(&[input_batches], input_schema, None)?;
+        let input =
+            Arc::new(TestMemoryExec::update_cache(&input)) as Arc<dyn ExecutionPlan>;
+
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col("group_col", &schema)?,
+            "group_col".to_string(),
+        )]);
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(sum_udaf(), vec![col("value", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("SUM(value)")
+                .build()?,
+        )];
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::FinalPartitioned,
+            group_by,
+            aggr_expr,
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+
+        let mut task_ctx = TaskContext::default();
+        let mut session_config = task_ctx.session_config().clone();
+        session_config = session_config.set(
+            "datafusion.execution.final_partition_reuse_probe_rows_threshold",
+            &datafusion_common::ScalarValue::UInt64(Some(1)),
+        );
+        session_config = session_config.set(
+            "datafusion.execution.final_partition_reuse_probe_ratio_threshold",
+            &datafusion_common::ScalarValue::Float64(Some(0.0)),
+        );
+        task_ctx = task_ctx.with_session_config(session_config);
+        let task_ctx = Arc::new(task_ctx);
+
+        let mut stream = FinalHashAggregateStream::new(&aggregate_exec, &task_ctx, 0)?;
+        let mut num_rows = 0;
+        while let Some(batch) = stream.next().await {
+            num_rows += batch?.num_rows();
+        }
+
+        assert_eq!(num_rows, 17 * 128);
 
         Ok(())
     }
