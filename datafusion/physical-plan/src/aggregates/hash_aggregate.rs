@@ -574,6 +574,9 @@ pub(crate) struct FinalHashAggregateStream {
     /// Probe state that decides whether partition-run reuse should be enabled.
     partition_reuse_mode: FinalPartitionReuseMode,
 
+    /// Number of final input rows staged through partition-run reuse.
+    final_partition_reuse_rows: metrics::Count,
+
     /// See comments for the same variable in [`PartialHashAggregateStream`].
     group_values_soft_limit: Option<usize>,
 
@@ -1176,6 +1179,9 @@ impl FinalHashAggregateStream {
         let partition_run_state =
             (!matches!(partition_reuse_mode, FinalPartitionReuseMode::Disabled))
                 .then(FinalPartitionRunState::new);
+        let final_partition_reuse_rows = MetricBuilder::new(&agg.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("final_partition_reuse_rows", partition);
 
         Ok(Self {
             schema,
@@ -1184,6 +1190,7 @@ impl FinalHashAggregateStream {
             reservation,
             partition_run_state,
             partition_reuse_mode,
+            final_partition_reuse_rows,
             group_values_soft_limit: agg.limit_options().map(|config| config.limit()),
             state: Some(FinalHashAggregateState::ReadingInput { hash_table }),
         })
@@ -1225,6 +1232,7 @@ impl FinalHashAggregateStream {
         }
 
         let output_batch = strip_subpartition_column(batch, subpartition_idx)?;
+        self.final_partition_reuse_rows.add(output_batch.num_rows());
         let mut runs = Vec::new();
         let mut values = subpartitions.values().iter().copied().enumerate();
         if let Some((run_start, first_partition)) = values.next() {
@@ -1296,7 +1304,6 @@ impl FinalHashAggregateStream {
         };
 
         if should_reuse {
-            dbg!("should reuse partition runs");
             let probe_rows = probe.input_rows;
             let cached_size = probe.cached_size();
             let cached_batches = probe.into_cached_batches();
@@ -1304,7 +1311,6 @@ impl FinalHashAggregateStream {
             self.partition_reuse_mode = FinalPartitionReuseMode::Enabled;
             Ok(Some((cached_batches, cached_size)))
         } else {
-            dbg!("should not reuse partition runs");
             self.disable_partition_reuse();
             Ok(None)
         }
