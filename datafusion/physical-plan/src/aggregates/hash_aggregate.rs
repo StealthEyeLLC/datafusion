@@ -1129,11 +1129,10 @@ impl FinalHashAggregateStream {
                 .register(context.memory_pool());
         let uses_partition_runs = agg.mode == super::AggregateMode::FinalPartitioned;
         let options = &context.session_config().options().execution;
-        let probe_ratio_threshold =
-            options.skip_partial_aggregation_probe_ratio_threshold;
+        let probe_ratio_threshold = options.final_partition_reuse_probe_ratio_threshold;
         let partition_reuse_mode = if uses_partition_runs && probe_ratio_threshold < 1.0 {
             FinalPartitionReuseMode::Probing(FinalPartitionReuseProbe::new(
-                options.skip_partial_aggregation_probe_rows_threshold,
+                options.final_partition_reuse_probe_rows_threshold,
                 probe_ratio_threshold,
             ))
         } else {
@@ -1788,11 +1787,11 @@ mod tests {
         let mut task_ctx = TaskContext::default();
         let mut session_config = task_ctx.session_config().clone();
         session_config = session_config.set(
-            "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+            "datafusion.execution.final_partition_reuse_probe_rows_threshold",
             &datafusion_common::ScalarValue::UInt64(Some(1)),
         );
         session_config = session_config.set(
-            "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+            "datafusion.execution.final_partition_reuse_probe_ratio_threshold",
             &datafusion_common::ScalarValue::Float64(Some(0.0)),
         );
         task_ctx = task_ctx.with_session_config(session_config);
@@ -1880,11 +1879,11 @@ mod tests {
         let mut task_ctx = TaskContext::default();
         let mut session_config = task_ctx.session_config().clone();
         session_config = session_config.set(
-            "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+            "datafusion.execution.final_partition_reuse_probe_rows_threshold",
             &datafusion_common::ScalarValue::UInt64(Some(1)),
         );
         session_config = session_config.set(
-            "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+            "datafusion.execution.final_partition_reuse_probe_ratio_threshold",
             &datafusion_common::ScalarValue::Float64(Some(0.9)),
         );
         task_ctx = task_ctx.with_session_config(session_config);

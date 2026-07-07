@@ -912,6 +912,18 @@ config_namespace! {
         /// aggregation ratio check and trying to switch to skipping aggregation mode
         pub skip_partial_aggregation_probe_rows_threshold: usize, default = 100_000
 
+        /// Group ratio (number of distinct groups / number of input rows)
+        /// threshold for enabling final hash aggregation partition reuse. If
+        /// the value is greater, the final aggregate will buffer and replay
+        /// subpartitions to reuse hash table buffers across them. A value
+        /// greater than or equal to 1 disables this optimization.
+        pub final_partition_reuse_probe_ratio_threshold: f64, default = 0.8
+
+        /// Number of input rows final partitioned aggregation should process
+        /// before checking the group ratio and deciding whether to enable
+        /// partition reuse.
+        pub final_partition_reuse_probe_rows_threshold: usize, default = 100_000
+
         /// Should DataFusion use row number estimates at the input to decide
         /// whether increasing parallelism is beneficial or not. By default,
         /// only exact row numbers (not estimates) are used for this decision.
