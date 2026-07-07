@@ -1296,6 +1296,7 @@ impl FinalHashAggregateStream {
         };
 
         if should_reuse {
+            dbg!("should reuse partition runs");
             let probe_rows = probe.input_rows;
             let cached_size = probe.cached_size();
             let cached_batches = probe.into_cached_batches();
@@ -1303,6 +1304,7 @@ impl FinalHashAggregateStream {
             self.partition_reuse_mode = FinalPartitionReuseMode::Enabled;
             Ok(Some((cached_batches, cached_size)))
         } else {
+            dbg!("should not reuse partition runs");
             self.disable_partition_reuse();
             Ok(None)
         }
