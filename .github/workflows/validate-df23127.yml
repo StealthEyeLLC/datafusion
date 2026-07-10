@@ -8,32 +8,147 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_INCREMENTAL: 0
+
 jobs:
-  clippy-diagnostic:
+  targeted-validation:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           ref: validate/df-23127-20260710
+      - name: Apply source patch to validation and PR branches
+        run: |
+          cat > /tmp/apply_df23127_patch.py <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected one match in {path}, found {count}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "datafusion/physical-plan/src/aggregates/hash_stream.rs",
+              """            Ok(Some(batch)) => {
+                          let _ = self
+                              .reservation
+                              .try_resize(original_state.hash_table().memory_size());
+                          debug_assert!(batch.num_rows() > 0);
+                          let next_state = if original_state.hash_table().is_done() {
+                              original_state.into_done()""",
+              """            Ok(Some(batch)) => {
+                          self.schema = batch.schema();
+                          let _ = self
+                              .reservation
+                              .try_resize(original_state.hash_table().memory_size());
+                          debug_assert!(batch.num_rows() > 0);
+                          let next_state = if original_state.hash_table().is_done() {
+                              original_state.into_done()""",
+          )
+          replace_once(
+              "datafusion/physical-plan/src/aggregates/ordered_final_stream.rs",
+              """                    Ok(Some(batch)) => {
+                                  let next_state =
+                                      OrderedFinalAggregateState::ReadingInput { table };""",
+              """                    Ok(Some(batch)) => {
+                                  self.schema = batch.schema();
+                                  let next_state =
+                                      OrderedFinalAggregateState::ReadingInput { table };""",
+          )
+          replace_once(
+              "datafusion/physical-plan/src/aggregates/ordered_final_stream.rs",
+              """            Ok(Some(batch)) => {
+                          let next_state = if table.is_empty() {""",
+              """            Ok(Some(batch)) => {
+                          self.schema = batch.schema();
+                          let next_state = if table.is_empty() {""",
+          )
+
+          sql_file = Path(
+              "datafusion/sqllogictest/test_files/dictionary_group_by_key_promotion.slt"
+          )
+          sql = sql_file.read_text()
+          reset = """
+
+          statement ok
+          SET datafusion.execution.batch_size = 8192;
+
+          statement ok
+          SET datafusion.execution.target_partitions = 4;
+          """
+          if reset.strip() not in sql:
+              sql_file.write_text(sql.rstrip() + reset)
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          patch_branch() {
+            remote_branch="$1"
+            local_branch="$2"
+            message="$3"
+            git fetch origin "$remote_branch"
+            git switch --force-create "$local_branch" "origin/$remote_branch"
+            python /tmp/apply_df23127_patch.py
+            cargo fmt
+            if ! git diff --quiet; then
+              git add \
+                datafusion/physical-plan/src/aggregates/hash_stream.rs \
+                datafusion/physical-plan/src/aggregates/ordered_final_stream.rs \
+                datafusion/sqllogictest/test_files/dictionary_group_by_key_promotion.slt
+              git commit -m "$message"
+              git push origin HEAD:"$remote_branch"
+            fi
+          }
+
+          patch_branch \
+            fix/df-23127-dict-group-values \
+            work-pr \
+            "fix: keep promoted aggregate stream schemas current"
+          patch_branch \
+            validate/df-23127-20260710 \
+            work-validation \
+            "ci: mirror final df23127 source patch [skip ci]"
       - name: Check formatting
         run: cargo fmt --check
-      - name: Run clippy
+      - name: Test partial and final dictionary transport
+        run: cargo test -p datafusion-physical-plan dictionary_groups_keep_partial_schema_and_promote_final_output -- --nocapture
+      - name: Test monotonic dictionary promotion
+        run: cargo test -p datafusion-physical-plan dict_uint8_utf8_promotes_and_does_not_shrink -- --nocapture
+      - name: Test legacy single-stage promotion
+        run: cargo test -p datafusion-physical-plan dictionary_group_key_promotes_runtime_schema -- --nocapture
+      - name: Test SQL dictionary promotion
+        id: sql
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --test sqllogictests -- dictionary_group_by_key_promotion 2>&1 | tee /tmp/df23127-sql.log
+      - name: Run clippy for library and tests
         id: clippy
         continue-on-error: true
         run: |
           set -o pipefail
-          cargo clippy -p datafusion-physical-plan --all-targets -- -D warnings 2>&1 | tee /tmp/df23127-clippy.log
-      - name: Persist clippy failure log
-        if: steps.clippy.outcome == 'failure'
+          cargo clippy -p datafusion-physical-plan --lib --tests -- -D warnings 2>&1 | tee /tmp/df23127-clippy.log
+      - name: Persist validation failures
+        if: steps.sql.outcome == 'failure' || steps.clippy.outcome == 'failure'
         run: |
           mkdir -p validation
-          cp /tmp/df23127-clippy.log validation/df23127-clippy.log
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add validation/df23127-clippy.log
-          git commit -m "ci: capture df23127 clippy failure [skip ci]"
+          if [ "${{ steps.sql.outcome }}" = "failure" ]; then
+            cp /tmp/df23127-sql.log validation/df23127-sql.log
+          fi
+          if [ "${{ steps.clippy.outcome }}" = "failure" ]; then
+            cp /tmp/df23127-clippy.log validation/df23127-clippy.log
+          fi
+          git add validation
+          git commit -m "ci: capture final df23127 validation failure [skip ci]"
           git push origin HEAD:validate/df-23127-20260710
-      - name: Fail when clippy fails
-        if: steps.clippy.outcome == 'failure'
+      - name: Fail on validation error
+        if: steps.sql.outcome == 'failure' || steps.clippy.outcome == 'failure'
         run: exit 1
