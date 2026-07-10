@@ -6,7 +6,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   targeted-tests:
@@ -18,22 +18,15 @@ jobs:
           ref: validate/df-23127-20260710
       - name: Show toolchain
         run: rustc --version && cargo --version
-      - name: Format validation branch
-        run: |
-          cargo fmt
-          git diff --check
-      - name: Commit rustfmt output
-        run: |
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add datafusion
-            git commit -m "style: apply rustfmt"
-            git push origin HEAD:validate/df-23127-20260710
-          fi
+      - name: Check formatting
+        run: cargo fmt --check
       - name: Test partial and final dictionary transport
         run: cargo test -p datafusion-physical-plan dictionary_groups_keep_partial_schema_and_promote_final_output -- --nocapture
       - name: Test monotonic dictionary promotion
         run: cargo test -p datafusion-physical-plan dict_uint8_utf8_promotes_and_does_not_shrink -- --nocapture
       - name: Test legacy single-stage promotion
         run: cargo test -p datafusion-physical-plan dictionary_group_key_promotes_runtime_schema -- --nocapture
+      - name: Test SQL dictionary promotion
+        run: cargo test --test sqllogictests -- dictionary_group_by_key_promotion
+      - name: Run clippy
+        run: cargo clippy -p datafusion-physical-plan --all-targets -- -D warnings
