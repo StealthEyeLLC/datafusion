@@ -1,9 +1,9 @@
 name: Validate DataFusion 23127
 
 on:
-  push:
+  pull_request:
     branches:
-      - validate/df-23127-20260710
+      - main
 
 permissions:
   contents: read
