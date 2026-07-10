@@ -1,0 +1,26 @@
+name: Validate DataFusion 23127
+
+on:
+  push:
+    branches:
+      - validate/df-23127-20260710
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test partial and final dictionary transport
+        run: cargo test -p datafusion-physical-plan dictionary_groups_keep_partial_schema_and_promote_final_output -- --nocapture
+      - name: Test monotonic dictionary promotion
+        run: cargo test -p datafusion-physical-plan dict_uint8_utf8_promotes_and_does_not_shrink -- --nocapture
+      - name: Test legacy single-stage promotion
+        run: cargo test -p datafusion-physical-plan dictionary_group_key_promotes_runtime_schema -- --nocapture
