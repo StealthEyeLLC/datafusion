@@ -6,7 +6,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   targeted-tests:
@@ -14,18 +14,23 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: validate/df-23127-20260710
       - name: Show toolchain
         run: rustc --version && cargo --version
-      - name: Format disposable checkout
+      - name: Format validation branch
         run: |
           cargo fmt
-          git diff --binary > /tmp/rustfmt.patch
           git diff --check
-      - name: Upload rustfmt patch
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-patch
-          path: /tmp/rustfmt.patch
+      - name: Commit rustfmt output
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add datafusion
+            git commit -m "style: apply rustfmt"
+            git push origin HEAD:validate/df-23127-20260710
+          fi
       - name: Test partial and final dictionary transport
         run: cargo test -p datafusion-physical-plan dictionary_groups_keep_partial_schema_and_promote_final_output -- --nocapture
       - name: Test monotonic dictionary promotion
