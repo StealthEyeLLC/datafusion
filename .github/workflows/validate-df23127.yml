@@ -9,41 +9,31 @@ permissions:
   contents: write
 
 jobs:
-  targeted-tests:
+  clippy-diagnostic:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           ref: validate/df-23127-20260710
-      - name: Show toolchain
-        run: rustc --version && cargo --version
       - name: Check formatting
         run: cargo fmt --check
-      - name: Test partial and final dictionary transport
-        run: cargo test -p datafusion-physical-plan dictionary_groups_keep_partial_schema_and_promote_final_output -- --nocapture
-      - name: Test monotonic dictionary promotion
-        run: cargo test -p datafusion-physical-plan dict_uint8_utf8_promotes_and_does_not_shrink -- --nocapture
-      - name: Test legacy single-stage promotion
-        run: cargo test -p datafusion-physical-plan dictionary_group_key_promotes_runtime_schema -- --nocapture
-      - name: Test SQL dictionary promotion
-        id: sql
+      - name: Run clippy
+        id: clippy
         continue-on-error: true
         run: |
           set -o pipefail
-          cargo test --test sqllogictests -- dictionary_group_by_key_promotion 2>&1 | tee /tmp/df23127-sql.log
-      - name: Persist SQL failure log
-        if: steps.sql.outcome == 'failure'
+          cargo clippy -p datafusion-physical-plan --all-targets -- -D warnings 2>&1 | tee /tmp/df23127-clippy.log
+      - name: Persist clippy failure log
+        if: steps.clippy.outcome == 'failure'
         run: |
           mkdir -p validation
-          cp /tmp/df23127-sql.log validation/df23127-sql.log
+          cp /tmp/df23127-clippy.log validation/df23127-clippy.log
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add validation/df23127-sql.log
-          git commit -m "ci: capture df23127 SQL failure [skip ci]"
+          git add validation/df23127-clippy.log
+          git commit -m "ci: capture df23127 clippy failure [skip ci]"
           git push origin HEAD:validate/df-23127-20260710
-      - name: Run clippy
-        run: cargo clippy -p datafusion-physical-plan --all-targets -- -D warnings
-      - name: Fail when SQL regression fails
-        if: steps.sql.outcome == 'failure'
+      - name: Fail when clippy fails
+        if: steps.clippy.outcome == 'failure'
         run: exit 1
